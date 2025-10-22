@@ -19,6 +19,7 @@ use std::{
     env,
     io::{stderr, Result, Write},
     path::{Component, Path, PathBuf},
+    ffi::{OsString},
 };
 
 use crossterm::{
@@ -93,7 +94,7 @@ enum Keymap {
 /// This struct contains all the data necessary to drive the UI and logic.
 struct AppState {
     /// A vector of strings representing the components of the current path.
-    path_parts: Vec<String>,
+    path_parts: Vec<OsString>,
     /// The index of the currently selected part in `path_parts`.
     current_index: usize,
     /// Stores numeric input for Vim-style count prefixes (e.g., `3h`).
@@ -104,7 +105,7 @@ impl AppState {
     /// Creates a new `AppState` from a vector of path components.
     ///
     /// By default, the last path component is selected.
-    fn new(path_parts: Vec<String>) -> Self {
+    fn new(path_parts: Vec<OsString>) -> Self {
         let current_index = path_parts.len().saturating_sub(1);
         Self {
             path_parts,
@@ -147,16 +148,25 @@ impl AppState {
     /// Selects a path component based on the terminal column of a mouse click.
     ///
     /// This function iterates through the path parts, calculating their cumulative width,
-    /// to determine which part covers the given `column`.
+    /// to determine which part covers the given `column`. It handles clicks before
+    /// the first part and after the last part gracefully.
     fn select_part_at_column(&mut self, column: u16) {
         let mut current_pos: u16 = 0;
+        // Default to the first part (index 0). This handles clicks before any text.
+        let mut new_index = 0;
+
         for (i, part) in self.path_parts.iter().enumerate() {
-            let part_len = part.chars().count() as u16;
-            if column >= current_pos && column < current_pos + part_len {
-                self.current_index = i;
-                break;
+            // As soon as the cursor position is beyond the start of the current part,
+            // it becomes the candidate for selection.
+            if column >= current_pos {
+                new_index = i;
             }
-            current_pos += part_len;
+            current_pos += part.to_string_lossy().chars().count() as u16;
+        }
+
+        // If the path_parts vector is not empty, set the index.
+        if !self.path_parts.is_empty() {
+            self.current_index = new_index;
         }
     }
 
@@ -204,7 +214,7 @@ fn get_keymap() -> Keymap {
 /// # Examples
 /// - Unix: `/home/user/project` -> `["/", "home/", "user/", "project"]`
 /// - Windows: `C:\Users\Admin` -> `["C:\", "Users\", "Admin"]`
-fn split_path(path: &Path) -> Vec<String> {
+fn split_path(path: &Path) -> Vec<OsString> {
     let mut parts = Vec::new();
     let mut components = path.components().peekable();
 
@@ -212,31 +222,28 @@ fn split_path(path: &Path) -> Vec<String> {
         let is_last = components.peek().is_none();
         let part = match component {
             Component::Prefix(prefix) => {
-                let mut p = prefix.as_os_str().to_string_lossy().to_string();
-                // Special handling for Windows paths like "C:" followed by "\"
+                let mut p = prefix.as_os_str().to_owned();
                 if let Some(Component::RootDir) = components.peek() {
                     components.next(); // Consume the RootDir
-                    p.push(std::path::MAIN_SEPARATOR);
+                    p.push(std::path::MAIN_SEPARATOR_STR);
                 }
                 p
             }
-            Component::RootDir => std::path::MAIN_SEPARATOR_STR.to_string(),
+            Component::RootDir => OsString::from(std::path::MAIN_SEPARATOR_STR),
             Component::Normal(s) => {
-                let mut p = s.to_string_lossy().to_string();
+                let mut p = s.to_owned();
                 if !is_last {
-                    p.push(std::path::MAIN_SEPARATOR);
+                    p.push(std::path::MAIN_SEPARATOR_STR);
                 }
                 p
             }
-            // Ignore "." and ".." components
             _ => continue,
         };
         parts.push(part);
     }
 
-    // Handle the edge case of an empty path or a "." path.
     if parts.is_empty() {
-        parts.push(".".to_string());
+        parts.push(OsString::from("."));
     }
 
     parts
@@ -257,15 +264,16 @@ fn render<W: Write>(out: &mut W, state: &AppState) -> Result<()> {
         // Clear(ClearType::FromCursorDown)
     )?;
     for (i, part) in state.path_parts.iter().enumerate() {
+        let display_part = part.to_string_lossy();
         if i == state.current_index {
             execute!(
                 out,
                 SetAttribute(Attribute::Reverse), // Set reverse video for selection
-                Print(part),
+                Print(display_part),
                 SetAttribute(Attribute::Reset) // Reset attributes
             )?;
         } else {
-            execute!(out, Print(part))?;
+            execute!(out, Print(display_part))?;
         }
     }
     out.flush()
@@ -501,8 +509,25 @@ fn run_interactive_selector() -> Result<Option<PathBuf>> {
 fn main() {
     match run_interactive_selector() {
         Ok(Some(path)) => {
-            // The final path is printed to stdout for the shell to capture.
-            println!("{}", path.to_string_lossy());
+            #[cfg(unix)]
+            {
+                use std::{io::{self, Write}, os::unix::ffi::OsStrExt as _};
+                let bytes = path.as_os_str().as_bytes();
+                if let Err(e) = io::stdout().write_all(bytes) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(2);
+                }
+                if let Err(e) = io::stdout().write_all(b"\n") {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(2);
+                }
+            }
+
+            // On other platforms (like Windows), `println!` with `display()` is safe.
+            #[cfg(not(unix))]
+            {
+                print!("{}", path.display());
+            }
         }
         Ok(None) => {
             // User quit; exit with a non-zero status code.
