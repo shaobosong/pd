@@ -28,40 +28,46 @@ cargo install --path .
 ```
 
 ## Example
-```sh
-vim ud.bash
-```
-
+- bash
 ```bash
-# ██╗   ██╗██████╗
-# ██║   ██║██╔══██╗
-# ██║   ██║██║  ██║
-# ██║   ██║██║  ██║
-# ╚██████╔╝██████╔╝
-#  ╚═════╝ ╚═════╝ ud: Interactively change directory upwards
-
-ud() {
-    local clear_line=$(tput el) # Clear line from cursor to end
-    local navigator ret retcode target_dir error
-    navigator="$(command -v pd)"
-    ret="$(${navigator})"; retcode=$?
-    if test "$retcode" -ne 0; then
-        error="$ret"
-        test -n "$error" &&
-            printf "\r${clear_line}%s" "${error}" >&2 ||
-            printf "\r${clear_line}"
-    else
-        target_dir="$ret"
-        printf "\r${clear_line}%s\n" "${target_dir}"
-        cd "$target_dir"
-    fi
-    return "$retcode"
+function ud() {
+  local d; d=$(pd) && cd "$d"
 }
 ```
 
+- fish
+```fish
+function ud
+  set -l d (pd); and cd $d
+end
+```
+
+- nushell
+```nushell
+def --env --wrapped ud [...rest:string] {
+  cd $'(pd -- ...$rest | str trim)'
+}
+```
+
+- posix
 ```sh
-source /path/ud.bash
-ud
+ud() {
+  d=$(pd) && cd "$d"
+}
+```
+
+- powershell
+```pwsh
+function ud {
+  $d = pd; if ($LASTEXITCODE -eq 0 -and $d) { Set-Location $d }
+}
+```
+
+- zsh
+```zsh
+function ud() {
+  local d; d=$(pd) && cd "$d"
+}
 ```
 
 ## LICENSE
