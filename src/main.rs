@@ -613,10 +613,20 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState) -> Result<EventAc
         MouseEventKind::Moved => {
             state.select_part_at_column(mouse.column);
         }
-        // FIXME: 'Up' event is unexpectedly reserved in MSYS2 after exit.
+        #[cfg(windows)]
+        MouseEventKind::Up(MouseButton::Left) => {
+            return Ok(EventAction::Confirm(state.selected_path()));
+        }
+        #[cfg(windows)]
+        MouseEventKind::Up(MouseButton::Right) => {
+            return Ok(EventAction::Quit);
+        }
+        // FIXME: 'Up' event is unexpectedly reserved in WIN32 after exit.
+        #[cfg(unix)]
         MouseEventKind::Down(MouseButton::Left) => {
             return Ok(EventAction::Confirm(state.selected_path()));
         }
+        #[cfg(unix)]
         MouseEventKind::Down(MouseButton::Right) => {
             return Ok(EventAction::Quit);
         }
