@@ -17,9 +17,9 @@
 
 use std::{
     env,
+    ffi::OsString,
     io::{stderr, Result, Write},
     path::{Component, Path, PathBuf},
-    ffi::{OsString},
 };
 
 use crossterm::{
@@ -80,6 +80,15 @@ impl Drop for TermCleanup {
     }
 }
 
+/// Represents the application's input mode for handling multi-key sequences.
+enum InputMode {
+    /// The default mode, where each key press is treated as a standalone command.
+    Normal,
+    /// A mode where the application is waiting for the next key event to complete a command.
+    /// The contained closure will be executed with the next key press.
+    WaitForNextKey(Box<dyn FnOnce(KeyEvent, &mut AppState)>),
+}
+
 /// Defines the supported keymap schemes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keymap {
@@ -87,6 +96,20 @@ enum Keymap {
     Vim,
     /// Emacs-style keybindings (Ctrl-f, Ctrl-b, etc.).
     Emacs,
+}
+
+/// The direction for a character-based jump (`f`/`F`).
+#[derive(Clone, Copy)]
+enum JumpDirection {
+    Forward,
+    Backward,
+}
+
+/// Stores the state of the last character jump for repetition with `;` and `,`.
+#[derive(Clone, Copy)]
+struct LastJump {
+    char: char,
+    direction: JumpDirection,
 }
 
 /// Holds the current state of the application.
@@ -99,6 +122,10 @@ struct AppState {
     current_index: usize,
     /// Stores numeric input for Vim-style count prefixes (e.g., `3h`).
     count_input: String,
+    /// Stores the last character jump action to allow for repeats.
+    last_jump: Option<LastJump>,
+    /// The current input mode, used to handle multi-key sequences generically.
+    input_mode: InputMode,
 }
 
 impl AppState {
@@ -111,6 +138,8 @@ impl AppState {
             path_parts,
             current_index,
             count_input: String::new(),
+            last_jump: None,
+            input_mode: InputMode::Normal,
         }
     }
 
@@ -143,6 +172,69 @@ impl AppState {
     fn move_to_middle(&mut self) {
         self.current_index = self.path_parts.len() / 2;
         self.count_input.clear();
+    }
+
+    /// Implements the core logic for jumping to a path component containing a target character.
+    ///
+    /// This function searches for the `n`-th path component that contains `target_char`,
+    /// where `n` is determined by the numeric `count_input`. The search proceeds
+    /// from the current selection in the given `direction`. If a match is found,
+    /// `current_index` is updated to the new position. This function does not
+    /// record the jump for repetition; it only performs the search and selection.
+    fn find_and_select_char_match(&mut self, direction: JumpDirection, target_char: char) {
+        let count = self.count_input.parse::<usize>().unwrap_or(1);
+        self.count_input.clear();
+
+        let mut found_count = 0;
+        // Define an iterator over the indices based on the search direction.
+        let range: Box<dyn Iterator<Item = usize>> = match direction {
+            JumpDirection::Forward => Box::new((self.current_index + 1)..self.path_parts.len()),
+            JumpDirection::Backward => Box::new((0..self.current_index).rev()),
+        };
+
+        for i in range {
+            if self.path_parts[i].to_string_lossy().contains(target_char) {
+                found_count += 1;
+                if found_count == count {
+                    self.current_index = i;
+                    return; // Found it
+                }
+            }
+        }
+    }
+
+    /// Initiates a character-based jump (like Vim's `f` or `F`) and records it for repetition.
+    ///
+    /// This function wraps the core jump logic from `find_and_select_char_match`. After
+    /// executing the jump, it stores the `target_char` and `direction` in `last_jump`.
+    /// This allows the user to repeat the same search forward (`;`) or backward (`,`).
+    fn jump_to_char(&mut self, direction: JumpDirection, target_char: char) {
+        self.find_and_select_char_match(direction, target_char);
+        // Record this jump so it can be repeated.
+        self.last_jump = Some(LastJump {
+            char: target_char,
+            direction,
+        });
+    }
+
+    /// Repeats the last `f` or `F` jump.
+    ///
+    /// `reverse` determines the direction: `false` for the same direction (`;`),
+    /// `true` for the opposite direction (`,`).
+    fn repeat_jump(&mut self, reverse: bool) {
+        if let Some(last_jump) = self.last_jump {
+            let direction = if reverse {
+                match last_jump.direction {
+                    JumpDirection::Forward => JumpDirection::Backward,
+                    JumpDirection::Backward => JumpDirection::Forward,
+                }
+            } else {
+                last_jump.direction
+            };
+            // Use the character from the last jump and call the main jump function.
+            // The main jump function will handle the new count from `count_input`.
+            self.find_and_select_char_match(direction, last_jump.char);
+        }
     }
 
     /// Selects a path component based on the terminal column of a mouse click.
@@ -281,22 +373,51 @@ fn render<W: Write>(out: &mut W, state: &AppState) -> Result<()> {
 
 /// Processes Vim-style key bindings to navigate the path components.
 ///
-/// This function updates the application state based on Vim key bindings such as
-/// `h`, `j`, `k`, `l`, or arrow keys for navigation, and handles numeric prefixes
-/// for repeated actions.
+/// This function updates the application state based on Vim key bindings. For multi-key
+/// sequences like `f` or `F`, it sets the application's `input_mode` to
+/// `InputMode::WaitForNextKey` with a closure that defines the subsequent action.
 ///
 /// # Arguments
 /// * `key`: The keyboard event to process.
 /// * `state`: Mutable reference to the current application state.
 fn handle_vim_keys(key: KeyEvent, state: &mut AppState) {
     match key.code {
-        KeyCode::Char('h' | 'k' | 'b') | KeyCode::Left => state.move_by(-1),
-        KeyCode::Char('l' | 'j' | 'w') | KeyCode::Right => state.move_by(1),
-        KeyCode::Char('^' | 'H') | KeyCode::Home => state.move_to_start(),
-        KeyCode::Char('$' | 'L') | KeyCode::End => state.move_to_end(),
+        // State-changing Motions
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            let direction = if key.code == KeyCode::Char('f') {
+                JumpDirection::Forward
+            } else {
+                JumpDirection::Backward
+            };
+
+            // Capture the current count now, as it will be used by the closure.
+            let count_for_jump = state.count_input.clone();
+            state.count_input.clear();
+
+            // Set the application to wait for the next key.
+            state.input_mode = InputMode::WaitForNextKey(Box::new(move |next_key, current_state| {
+                // This closure will be executed with the next key press.
+                if let KeyCode::Char(c) = next_key.code {
+                    // Restore the captured count before executing the jump.
+                    current_state.count_input = count_for_jump;
+                    current_state.jump_to_char(direction, c);
+                }
+                // If any other key is pressed (e.g., Esc), the closure does nothing,
+                // effectively canceling the jump command.
+            }));
+        }
+
+        // Immediate Motions
+        KeyCode::Char(';') => state.repeat_jump(false),
+        KeyCode::Char(',') => state.repeat_jump(true),
+        KeyCode::Char('h' | 'k' | 'b') => state.move_by(-1),
+        KeyCode::Char('l' | 'j' | 'w') => state.move_by(1),
+        KeyCode::Char('^' | 'H') => state.move_to_start(),
+        KeyCode::Char('$' | 'L') => state.move_to_end(),
         KeyCode::Char('M') => state.move_to_middle(),
+
+        // Count Accumulation
         KeyCode::Char(c) if c.is_ascii_digit() => {
-            // In Vim, '0' moves to the start unless it's part of a count.
             if c == '0' && state.count_input.is_empty() {
                 state.move_to_start();
             } else {
@@ -310,7 +431,7 @@ fn handle_vim_keys(key: KeyEvent, state: &mut AppState) {
 /// Processes Emacs-style key bindings to navigate the path components.
 ///
 /// This function updates the application state based on Emacs key bindings such as
-/// `Ctrl-b`, `Ctrl-f`, `Alt-b`, `Alt-f`, or arrow keys for navigation.
+/// `Ctrl-b`, `Ctrl-f`, `Alt-b`, `Alt-f` for navigation.
 ///
 /// # Arguments
 /// * `key`: The keyboard event to process.
@@ -318,21 +439,29 @@ fn handle_vim_keys(key: KeyEvent, state: &mut AppState) {
 fn handle_emacs_keys(key: KeyEvent, state: &mut AppState) {
     const CTRL: KeyModifiers = KeyModifiers::CONTROL;
     const ALT: KeyModifiers = KeyModifiers::ALT;
+
     match key.code {
-        // C-b, Alt-b, Left
+        KeyCode::Char(']') if key.modifiers.contains(CTRL) => {
+            // Set the application to wait for the next key.
+            state.input_mode = InputMode::WaitForNextKey(Box::new(move |next_key, current_state| {
+                // This closure will be executed with the next key press.
+                if let KeyCode::Char(c) = next_key.code {
+                    current_state.jump_to_char(JumpDirection::Forward, c);
+                }
+                // If any other key is pressed (e.g., Esc), the closure does nothing,
+                // effectively canceling the jump command.
+            }));
+        }
+        // C-b, Alt-b
         KeyCode::Char('b') if key.modifiers.contains(CTRL) => state.move_by(-1),
         KeyCode::Char('b') if key.modifiers.contains(ALT) => state.move_by(-1),
-        KeyCode::Left => state.move_by(-1),
-        // C-f, Alt-f, Right
+        // C-f, Alt-f
         KeyCode::Char('f') if key.modifiers.contains(CTRL) => state.move_by(1),
         KeyCode::Char('f') if key.modifiers.contains(ALT) => state.move_by(1),
-        KeyCode::Right => state.move_by(1),
-        // C-a, Home
+        // C-a
         KeyCode::Char('a') if key.modifiers.contains(CTRL) => state.move_to_start(),
-        KeyCode::Home => state.move_to_start(),
-        // C-e, End
+        // C-e
         KeyCode::Char('e') if key.modifiers.contains(CTRL) => state.move_to_end(),
-        KeyCode::End => state.move_to_end(),
         _ => {}
     }
 }
@@ -365,10 +494,78 @@ fn handle_interrupt() {
     unreachable!();
 }
 
-/// Handles keyboard events based on the selected keymap and updates the application state.
+/// Processes key events when the application is in the `Normal` input mode.
 ///
-/// This function processes key presses, applying Vim or Emacs key bindings, and handles
-/// special actions like confirming a selection or quitting.
+/// This function acts as the standard input handler. It first delegates the key
+/// event to the active keymap-specific handler (`handle_vim_keys` or
+/// `handle_emacs_keys`), which may perform an action or transition the application
+/// into the `WaitForNextKey` mode. Afterwards, it processes a set of shared
+/// keybindings (like arrow keys, Enter, Esc) that behave consistently across all keymaps.
+///
+/// # Arguments
+/// * `key`: The keyboard event to process.
+/// * `state`: Mutable reference to the current application state.
+/// * `keymap`: The currently active keymap (Vim or Emacs).
+///
+/// # Returns
+/// * `Result<EventAction>`: The resulting action to be taken by the main event loop.
+fn handle_normal_inputmode(key: KeyEvent, state: &mut AppState, keymap: Keymap) -> Result<EventAction> {
+    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+
+    match keymap {
+        Keymap::Vim => handle_vim_keys(key, state),
+        Keymap::Emacs => handle_emacs_keys(key, state),
+    }
+
+    match key.code {
+        // Shared Keys
+        KeyCode::Left => state.move_by(-1),
+        KeyCode::Right => state.move_by(1),
+        KeyCode::Home => state.move_to_start(),
+        KeyCode::End => state.move_to_end(),
+        KeyCode::Enter => {
+            return Ok(EventAction::Confirm(state.selected_path()));
+        }
+        KeyCode::Char('q') | KeyCode::Esc => {
+            // If waiting for a jump char, Esc should just cancel the wait.
+            // Our logic above handles this by doing nothing in the closure,
+            // so this only triggers in Normal mode.
+            return Ok(EventAction::Quit);
+        }
+        KeyCode::Char('c') if key.modifiers.contains(CTRL) => {
+            // On Unix, emulate a true Ctrl+C interrupt.
+            #[cfg(unix)]
+            handle_interrupt();
+
+            // On Windows, treat Ctrl+C as a "quit" action.
+            #[cfg(not(unix))]
+            return Ok(EventAction::Quit);
+        }
+        #[cfg(unix)]
+        KeyCode::Char('z') if key.modifiers.contains(CTRL) => {
+            // Ctrl+Z suspend is a Unix-only feature.
+            let _ = handle_suspend();
+        }
+        _ => {}
+    }
+
+    return Ok(EventAction::Continue);
+}
+
+/// Serves as the primary dispatcher for all keyboard events.
+///
+/// This function implements a state machine based on `state.input_mode`. It
+/// determines whether to execute a pending multi-key action or to process the
+/// key event through the normal input handler.
+///
+/// - If the mode is `InputMode::WaitForNextKey`, this function executes the
+///   stored closure with the current `key`. The key is considered "consumed,"
+///   and the mode is reset to `Normal`.
+/// - If the mode is `InputMode::Normal`, it delegates the key event to
+///   `handle_normal_inputmode` for standard processing.
+///
+/// This design centralizes state management, allowing any keymap to implement
+/// multi-key sequences without needing its own internal state machine.
 ///
 /// # Arguments
 /// * `key`: The keyboard event to process.
@@ -378,37 +575,22 @@ fn handle_interrupt() {
 /// # Returns
 /// * `Result<EventAction>`: Indicates the action to take (`Continue`, `Confirm`, or `Quit`).
 fn handle_key_event(key: KeyEvent, state: &mut AppState, keymap: Keymap) -> Result<EventAction> {
-    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
     if let KeyEventKind::Press = key.kind {
-        match keymap {
-            Keymap::Vim => handle_vim_keys(key, state),
-            Keymap::Emacs => handle_emacs_keys(key, state),
-        }
+        // Take ownership of the current input mode, replacing it with Normal.
+        // This ensures that the state is always reset after a pending action.
+        let current_mode = std::mem::replace(&mut state.input_mode, InputMode::Normal);
 
-        match key.code {
-            // --- Shared Keys ---
-            KeyCode::Enter => {
-                return Ok(EventAction::Confirm(state.selected_path()));
+        // If we were waiting for another key, execute the stored action.
+        match current_mode {
+            InputMode::WaitForNextKey(action) => {
+                action(key, state);
+                // The key has been consumed by the pending action, so we stop further processing.
+                return Ok(EventAction::Continue);
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(EventAction::Quit);
+            InputMode::Normal => {
+                // If there was no pending action, process the key using the keymap.
+                return handle_normal_inputmode(key, state, keymap);
             }
-            // --- Signal Handling ---
-            KeyCode::Char('c') if key.modifiers.contains(CTRL) => {
-                // On Unix, emulate a true Ctrl+C interrupt.
-                #[cfg(unix)]
-                handle_interrupt();
-
-                // On Windows, treat Ctrl+C as a "quit" action.
-                #[cfg(not(unix))]
-                return Ok(EventAction::Quit);
-            }
-            KeyCode::Char('z') if key.modifiers.contains(CTRL) => {
-                // Ctrl+Z suspend is a Unix-only feature.
-                #[cfg(unix)]
-                let _ = handle_suspend();
-            }
-            _ => {}
         }
     }
 
@@ -511,7 +693,10 @@ fn main() {
         Ok(Some(path)) => {
             #[cfg(unix)]
             {
-                use std::{io::{self, Write}, os::unix::ffi::OsStrExt as _};
+                use std::{
+                    io::{self, Write},
+                    os::unix::ffi::OsStrExt as _,
+                };
                 let bytes = path.as_os_str().as_bytes();
                 if let Err(e) = io::stdout().write_all(bytes) {
                     eprintln!("Error: {}", e);
